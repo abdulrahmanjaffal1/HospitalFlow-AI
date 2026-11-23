@@ -69,6 +69,9 @@ def render_approval_panel(recommendations: List[Recommendation]) -> List[Recomme
         with col_desc:
             st.markdown(f"**Situation:** {rec.description}")
             st.markdown(f"**Rationale:** {rec.rationale}")
+            if rec.ai_explanation:
+                st.markdown(f"**🤖 AI context (watsonx.ai):** {rec.ai_explanation}")
+                st.caption("AI-generated context. The priority and suggested action come from deterministic rules.")
             with st.expander("Suggested action"):
                 st.info(rec.suggested_action)
 

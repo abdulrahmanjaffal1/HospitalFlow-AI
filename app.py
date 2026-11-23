@@ -15,15 +15,26 @@ Architecture:
   agents/patient_flow_agent.py — Arrival/discharge flow analysis (deterministic)
   agents/staffing_agent.py   — Staffing constraint analysis (deterministic)
   agents/coordinator_agent.py — Combines findings, produces recommendations
+  agents/watsonx_explainer.py — IBM watsonx.ai foundation-model client (explanations)
+  agents/ai_guardrails.py    — Deterministic checks on all AI-generated text
   ui/dashboard.py            — Metrics dashboard panel
+  ui/ai_panel.py             — watsonx.ai situation briefing panel
   ui/approval.py             — Human approval interface
 
-Planned integrations (NOT yet implemented):
-  - watsonx.ai       : LLM-based reasoning and narrative generation
+Implemented:
+  - watsonx.ai : contextual explanations of the situation and of each
+                 recommendation (Coordinator Agent). Display-only; rules decide.
+Planned (NOT yet implemented):
   - watsonx Orchestrate: Automated multi-agent pipeline and workflow triggers
 """
 
 import streamlit as st
+
+try:  # optional: load WATSONX_* settings from a local .env file
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Page config must be the first Streamlit call
 st.set_page_config(
@@ -38,6 +49,7 @@ from agents.capacity_agent import CapacityAgent
 from agents.patient_flow_agent import PatientFlowAgent
 from agents.staffing_agent import StaffingAgent
 from agents.coordinator_agent import CoordinatorAgent
+from agents.watsonx_explainer import WatsonxExplainer
 from ui.dashboard import (
     render_status_banner,
     render_top_metrics,
@@ -46,15 +58,23 @@ from ui.dashboard import (
     render_agent_detail,
 )
 from ui.approval import render_approval_panel, render_decision_summary
+from ui.ai_panel import render_ai_briefing
 
 
 # ---------------------------------------------------------------------------
-# Agents (stateless — instantiated once)
+# Agents
 # ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _get_explainer() -> WatsonxExplainer:
+    """One watsonx.ai client per server process (reads WATSONX_* env vars)."""
+    return WatsonxExplainer.from_env()
+
+
 _capacity_agent  = CapacityAgent()
 _flow_agent      = PatientFlowAgent()
 _staffing_agent  = StaffingAgent()
-_coordinator     = CoordinatorAgent()
+_coordinator     = CoordinatorAgent(explainer=_get_explainer())
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +87,17 @@ def _run_analysis(scenario: str) -> None:
     cap_report  = _capacity_agent.run(snapshot)
     flow_report = _flow_agent.run(snapshot)
     staff_report = _staffing_agent.run(snapshot)
-    coord_report = _coordinator.run(cap_report, flow_report, staff_report, snapshot.notes)
+    use_ai = st.session_state.get("use_ai", True)
+    with st.spinner("Coordinator Agent is analysing… (asking watsonx.ai for explanations)"
+                    if use_ai and _coordinator.explainer.is_configured else "Analysing…"):
+        coord_report = _coordinator.run(
+            cap_report, flow_report, staff_report, snapshot.notes, use_ai=use_ai
+        )
+
+    # Clear widget state from the previous run so earlier approve/reject
+    # choices do not carry over to recommendations from a new analysis.
+    for key in [k for k in st.session_state if k.startswith(("decision_", "note_"))]:
+        del st.session_state[key]
 
     st.session_state["snapshot"]     = snapshot
     st.session_state["coord_report"] = coord_report
@@ -110,6 +140,20 @@ def render_sidebar() -> None:
         index=list(scenario_options.keys()).index(current),
     )
 
+    st.sidebar.subheader("🤖 watsonx.ai")
+    explainer = _coordinator.explainer
+    if explainer.is_configured:
+        st.sidebar.success(f"Configured · `{explainer.config.model_id}`")
+        st.sidebar.toggle(
+            "Generate AI explanations",
+            value=True,
+            key="use_ai",
+            help="When on, the Coordinator Agent asks watsonx.ai to explain the "
+                 "situation and each recommendation. Rules still decide priorities.",
+        )
+    else:
+        st.sidebar.info("Not configured: rule-based summaries only. See README to connect.")
+
     if st.sidebar.button("▶️  Run Analysis", use_container_width=True, type="primary"):
         _run_analysis(selected)
         st.rerun()
@@ -123,11 +167,13 @@ def render_sidebar() -> None:
         - Investigate operational constraints
         - Review AI-generated recommendations
 
-        **Current implementation:**
-        Deterministic rule-based Python calculations.
+        **Implemented:**
+        - Rule-based agents for capacity, flow and staffing
+        - 🤖 watsonx.ai explanations in the Coordinator Agent
+        - 🛡️ Deterministic guardrails on AI text
+        - ✅ Human approval of every action
 
-        **Planned integrations:**
-        - 🤖 watsonx.ai (LLM reasoning)
+        **Planned:**
         - 🔗 watsonx Orchestrate (agent pipeline)
 
         ---
@@ -177,7 +223,9 @@ def main() -> None:
         render_flags_panel(coord_report)
 
     with tab_analysis:
-        st.markdown("### Coordinator Situation Summary")
+        render_ai_briefing(coord_report.ai)
+        st.divider()
+        st.markdown("### Rule-based Situation Facts")
         st.markdown(coord_report.situation_summary)
         st.caption(f"ℹ️ {coord_report.agent_note}")
         st.divider()
